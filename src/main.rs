@@ -4,7 +4,6 @@ use std::io::{self, BufRead, Read, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PORT_NAME: &str = "/dev/ttyUSB5";
 const BAUD_RATE: u32 = 115200;
 /// Timeout for a single synchronous AT command round-trip.
 const CMD_TIMEOUT_MS: u64 = 10_000;
@@ -98,8 +97,8 @@ pub fn health_check(port: &mut Box<dyn SerialPort>) -> Result<(), String> {
 
     if resp.contains("+CPIN: SIM PIN") {
         // --- Step 3: Unlock SIM with PIN from environment ---
-        let pin = std::env::var("MODEM_PIN").map_err(|_| {
-            "SIM PIN required but MODEM_PIN environment variable is not set".to_string()
+        let pin = std::env::var("MODEM_PIN1").map_err(|_| {
+            "SIM PIN required but MODEM_PIN1 environment variable is not set".to_string()
         })?;
 
         // Log the command without exposing the actual PIN value.
@@ -110,7 +109,7 @@ pub fn health_check(port: &mut Box<dyn SerialPort>) -> Result<(), String> {
 
         if !resp.contains("OK") {
             return Err(
-                "SIM PIN unlock command rejected – check the MODEM_PIN value".to_string()
+                "SIM PIN unlock command rejected – check the MODEM_PIN1 value".to_string()
             );
         }
 
@@ -143,19 +142,25 @@ pub fn health_check(port: &mut Box<dyn SerialPort>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Resolve the serial port path from the environment.
+    let port_name = std::env::var("MODEM_AT_PORT").unwrap_or_else(|_| {
+        log("ERROR", "MODEM_AT_PORT environment variable is not set.");
+        std::process::exit(1);
+    });
+
     // Open the serial port.
-    let mut port = serialport::new(PORT_NAME, BAUD_RATE)
+    let mut port = serialport::new(&port_name, BAUD_RATE)
         .timeout(Duration::from_millis(200))
         .open()
         .unwrap_or_else(|e| {
             log(
                 "ERROR",
-                &format!("Failed to open {}: {}. Is the modem connected?", PORT_NAME, e),
+                &format!("Failed to open {}: {}. Is the modem connected?", port_name, e),
             );
             std::process::exit(1);
         });
 
-    log("INFO", &format!("Connected to {} at {} baud", PORT_NAME, BAUD_RATE));
+    log("INFO", &format!("Connected to {} at {} baud", port_name, BAUD_RATE));
 
     // Run the bootstrap health-check before accepting any commands.
     if let Err(e) = health_check(&mut port) {
