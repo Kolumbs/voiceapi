@@ -155,7 +155,10 @@ fn handle_client(
     for line in reader.lines() {
         let input = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                log("WARN", &format!("Client read error: {}", e));
+                break;
+            }
         };
         let cmd = input.trim().to_owned();
 
@@ -163,7 +166,7 @@ fn handle_client(
             continue;
         }
 
-        let mut w = writer.lock().expect("writer lock poisoned");
+        let mut w = writer.lock().expect("Serial port mutex poisoned; restart required");
         match cmd.as_str() {
             "!DTR_LOW" => {
                 w.write_data_terminal_ready(true)
