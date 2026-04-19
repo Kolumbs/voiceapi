@@ -1,6 +1,8 @@
 use chrono::Local;
 use serialport::SerialPort;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,6 +11,8 @@ const BAUD_RATE: u32 = 115200;
 const CMD_TIMEOUT_MS: u64 = 10_000;
 /// How long to wait after sending a PIN before re-checking CPIN state.
 const PIN_SETTLE_MS: u64 = 3_000;
+/// Unix socket file name (created in the working directory).
+const SOCKET_PATH: &str = "voiceapi.sock";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -138,6 +142,50 @@ pub fn health_check(port: &mut Box<dyn SerialPort>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Client connection handler
+// ---------------------------------------------------------------------------
+
+/// Handle a single Unix socket client: read lines and dispatch commands to
+/// the modem via the shared `writer`.
+fn handle_client(
+    stream: std::os::unix::net::UnixStream,
+    writer: Arc<Mutex<Box<dyn SerialPort>>>,
+) {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let input = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let cmd = input.trim().to_owned();
+
+        if cmd.is_empty() {
+            continue;
+        }
+
+        let mut w = writer.lock().expect("writer lock poisoned");
+        match cmd.as_str() {
+            "!DTR_LOW" => {
+                w.write_data_terminal_ready(true)
+                    .expect("Failed to assert DTR");
+                log("DTR", "Asserted (physical LOW / wake signal)");
+            }
+            "!DTR_HIGH" => {
+                w.write_data_terminal_ready(false)
+                    .expect("Failed to de-assert DTR");
+                log("DTR", "De-asserted (physical HIGH / sleep signal)");
+            }
+            _ => {
+                log("CMD", &cmd);
+                let at_cmd = format!("{}\r\n", cmd);
+                w.write_all(at_cmd.as_bytes())
+                    .expect("Failed to write to modem");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -168,15 +216,14 @@ fn main() {
         std::process::exit(1);
     }
 
-    log("INFO", "Ready – type AT commands below (or !DTR_LOW / !DTR_HIGH).");
-
-    // Split the port into a reader half (background thread) and a writer half
-    // (main thread, driven by STDIN).
-    let mut reader = port.try_clone().expect("Failed to clone port for reading");
-    let mut writer = port;
+    // Split into a reader half (background thread) and a shared writer half
+    // (one per connected client, protected by a mutex).
+    let reader_port = port.try_clone().expect("Failed to clone port for reading");
+    let writer: Arc<Mutex<Box<dyn SerialPort>>> = Arc::new(Mutex::new(port));
 
     // Background thread: modem → STDOUT
     thread::spawn(move || {
+        let mut reader = reader_port;
         let mut buf = [0u8; 1024];
         loop {
             match reader.read(&mut buf) {
@@ -194,36 +241,41 @@ fn main() {
         }
     });
 
-    // Main thread: STDIN → modem
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let input = line.expect("Failed to read from STDIN");
-        let cmd = input.trim();
+    // Remove any stale socket file from a previous run.
+    if std::path::Path::new(SOCKET_PATH).exists() {
+        std::fs::remove_file(SOCKET_PATH)
+            .unwrap_or_else(|e| log("WARN", &format!("Could not remove stale socket: {}", e)));
+    }
 
-        if cmd.is_empty() {
-            continue;
-        }
+    // Register Ctrl+C handler: clean up the socket file and exit.
+    ctrlc::set_handler(|| {
+        let _ = std::fs::remove_file(SOCKET_PATH);
+        std::process::exit(0);
+    })
+    .expect("Failed to set Ctrl+C handler");
 
-        match cmd {
-            "!DTR_LOW" => {
-                writer
-                    .write_data_terminal_ready(true)
-                    .expect("Failed to assert DTR");
-                log("DTR", "Asserted (physical LOW / wake signal)");
+    // Bind the Unix domain socket.
+    let listener = UnixListener::bind(SOCKET_PATH).unwrap_or_else(|e| {
+        log("ERROR", &format!("Failed to bind {}: {}", SOCKET_PATH, e));
+        std::process::exit(1);
+    });
+
+    log(
+        "INFO",
+        &format!("Listening on {} – send AT commands or !DTR_LOW / !DTR_HIGH", SOCKET_PATH),
+    );
+
+    // Accept client connections indefinitely.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let writer_clone = Arc::clone(&writer);
+                thread::spawn(move || handle_client(stream, writer_clone));
             }
-            "!DTR_HIGH" => {
-                writer
-                    .write_data_terminal_ready(false)
-                    .expect("Failed to de-assert DTR");
-                log("DTR", "De-asserted (physical HIGH / sleep signal)");
-            }
-            _ => {
-                log("CMD", cmd);
-                let at_cmd = format!("{}\r\n", cmd);
-                writer
-                    .write_all(at_cmd.as_bytes())
-                    .expect("Failed to write to modem");
+            Err(e) => {
+                log("ERROR", &format!("Accept error on socket: {}", e));
             }
         }
     }
 }
+
