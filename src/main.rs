@@ -1,229 +1,270 @@
-use chrono::Local;
-use serialport::SerialPort;
-use std::io::{self, BufRead, Read, Write};
+//! voiceapi — a single-client WebSocket service that fully owns a GSM modem and
+//! exposes a small, curated SMS API. See docs/plan for the architecture.
+
+mod api;
+mod serial;
+mod sms;
+mod store;
+
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const BAUD_RATE: u32 = 115200;
-/// Timeout for a single synchronous AT command round-trip.
-const CMD_TIMEOUT_MS: u64 = 10_000;
-/// How long to wait after sending a PIN before re-checking CPIN state.
-const PIN_SETTLE_MS: u64 = 3_000;
+use chrono::Local;
+use serde_json::{json, Value};
+use tungstenite::Message;
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
+use api::{ApiError, RequestBody};
+use serial::fatal;
+use sms::ModemExecutor;
+use store::Store;
 
-fn log(tag: &str, message: &str) {
-    let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z");
-    println!("[{}][{}] {}", ts, tag, message);
+/// Cached service/modem status, reported by `health` without touching the modem.
+struct Status {
+    modem: String, // "ready" | "not_ready"
+    sim: String,   // "READY" | "unknown"
+    started_at: String,
+    start: Instant,
 }
 
-// ---------------------------------------------------------------------------
-// Synchronous AT-command helper
-// ---------------------------------------------------------------------------
+type SharedStore = Arc<Mutex<Store>>;
+type SharedStatus = Arc<Mutex<Status>>;
+type SharedExec = Arc<Mutex<Option<ModemExecutor>>>;
 
-/// Send `command` (without terminator) to `port` and collect the full
-/// response up to the first `OK` or `ERROR` line, or until `timeout_ms`
-/// elapses.  Returns the raw response string.
-fn send_at_command(
-    port: &mut Box<dyn SerialPort>,
-    command: &str,
-    timeout_ms: u64,
-) -> Result<String, String> {
-    let cmd = format!("{}\r\n", command);
-    port.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
-    port.flush().map_err(|e| e.to_string())?;
+fn now_iso() -> String {
+    Local::now().to_rfc3339()
+}
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut response = String::new();
-    let mut buf = [0u8; 256];
+fn main() {
+    let db_path = std::env::var("VOICEAPI_DB").unwrap_or_else(|_| "./voiceapi.db".to_string());
+    let bind_addr =
+        std::env::var("VOICEAPI_TCP_ADDR").unwrap_or_else(|_| "127.0.0.1:9500".to_string());
+
+    // 1. SQLite — the source of truth. If this fails there is nowhere to record
+    //    the failure, so it is the one place we write to stderr and exit.
+    let store: SharedStore = match Store::open(&db_path) {
+        Ok(s) => Arc::new(Mutex::new(s)),
+        Err(e) => {
+            fatal("startup", &format!("cannot open SQLite {db_path}: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Listener. Same bootstrap-gap rule.
+    let listener = match TcpListener::bind(&bind_addr) {
+        Ok(l) => l,
+        Err(e) => {
+            fatal("startup", &format!("cannot bind {bind_addr}: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let status: SharedStatus = Arc::new(Mutex::new(Status {
+        modem: "not_ready".to_string(),
+        sim: "unknown".to_string(),
+        started_at: now_iso(),
+        start: Instant::now(),
+    }));
+
+    // 3. Modem bring-up — non-fatal. On failure the service still serves
+    //    `health` (reporting modem: not_ready); the error is recorded in SQLite.
+    let exec: SharedExec = Arc::new(Mutex::new(None));
+    bring_up(&store, &status, &exec);
+
+    // Occupancy gate: only one client may hold a connection at a time.
+    let busy = Arc::new(AtomicBool::new(false));
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let (store, status, exec, busy) =
+            (store.clone(), status.clone(), exec.clone(), busy.clone());
+        thread::spawn(move || handle_connection(stream, store, status, exec, busy));
+    }
+}
+
+/// Open the port and run health-check + SMS init; record any failure and leave
+/// `exec` as `None` (modem ops will then return `modem_not_ready`).
+fn bring_up(store: &SharedStore, status: &SharedStatus, exec: &SharedExec) {
+    let record = |msg: &str| {
+        if let Ok(s) = store.lock() {
+            let _ = s.record_error(&now_iso(), "error", "bringup", msg, None);
+        }
+    };
+
+    let port_name = match std::env::var("MODEM_AT_PORT") {
+        Ok(p) => p,
+        Err(_) => return record("MODEM_AT_PORT is not set"),
+    };
+    let mut port = match serial::open_port(&port_name) {
+        Ok(p) => p,
+        Err(e) => return record(&e),
+    };
+    if let Err(e) = serial::health_check(&mut port) {
+        return record(&e);
+    }
+    if let Err(e) = serial::sms_init(&mut port) {
+        return record(&e);
+    }
+
+    if let Ok(mut st) = status.lock() {
+        st.modem = "ready".to_string();
+        st.sim = "READY".to_string();
+    }
+    *exec.lock().unwrap() = Some(ModemExecutor::new(port));
+}
+
+fn handle_connection(
+    stream: TcpStream,
+    store: SharedStore,
+    status: SharedStatus,
+    exec: SharedExec,
+    busy: Arc<AtomicBool>,
+) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    let mut ws = match tungstenite::accept(stream) {
+        Ok(w) => w,
+        Err(_) => return, // not a WebSocket client / handshake failed
+    };
+
+    // Reject a second connection at the door.
+    if busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let resp = api::error_json(None, &ApiError::already_connected());
+        let _ = ws.send(Message::text(resp.to_string()));
+        let _ = ws.close(None);
+        return;
+    }
 
     loop {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "Timeout waiting for response to command: {}",
-                command
-            ));
-        }
-
-        match port.read(&mut buf) {
-            Ok(n) if n > 0 => {
-                response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                // A complete AT response always ends with a final result code.
-                let trimmed = response.trim_end();
-                if trimmed.ends_with("OK")
-                    || trimmed.ends_with("ERROR")
-                    || trimmed.contains("+CME ERROR")
-                    || trimmed.contains("+CMS ERROR")
-                {
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let resp = process_message(t.as_str(), &peer, &store, &status, &exec);
+                if ws.send(Message::text(resp.to_string())).is_err() {
                     break;
                 }
             }
-            // read() returns 0 bytes or a timeout error while waiting – sleep
-            // briefly to avoid busy-spinning.
-            _ => {
-                thread::sleep(Duration::from_millis(50));
-            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {} // ping/pong/binary: ignore (tungstenite auto-answers pings)
         }
     }
 
-    Ok(response)
+    busy.store(false, Ordering::Release);
 }
 
-// ---------------------------------------------------------------------------
-// Bootstrap / health-check
-// ---------------------------------------------------------------------------
+/// Parse, execute, persist, and produce the JSON response for one request.
+fn process_message(
+    text: &str,
+    peer: &str,
+    store: &SharedStore,
+    status: &SharedStatus,
+    exec: &SharedExec,
+) -> Value {
+    let started = Instant::now();
+    let ts_received = now_iso();
 
-/// Execute the bootstrap sequence before accepting any user commands:
-///
-/// 1. Enable automatic time-zone update from the network (`AT+CTZU=1`).
-/// 2. Query the SIM PIN state (`AT+CPIN?`).
-/// 3. If the SIM requires a PIN, unlock it using the `MODEM_PIN` environment
-///    variable and verify that the SIM reaches the READY state.
-pub fn health_check(port: &mut Box<dyn SerialPort>) -> Result<(), String> {
-    // --- Step 1: Enable network time-zone synchronisation ---
-    log("BOOT", "Enabling automatic time-zone update (AT+CTZU=1)");
-    let resp = send_at_command(port, "AT+CTZU=1", CMD_TIMEOUT_MS)?;
-    log("MODEM", resp.trim());
-    if !resp.contains("OK") {
-        return Err("Failed to enable automatic time-zone update (AT+CTZU=1)".to_string());
+    let (id, body) = match api::parse_request(text) {
+        Ok(v) => v,
+        Err((id, e)) => {
+            record_parse_failure(store, &ts_received, peer, id, text, &e, started);
+            return api::error_json(id, &e);
+        }
+    };
+
+    let op_name = body.op_name();
+    let rowid = store
+        .lock()
+        .unwrap()
+        .insert_request(&ts_received, peer, id, op_name, text)
+        .ok();
+
+    let result: Result<Value, ApiError> = match body {
+        RequestBody::Health => Ok(health_value(status, store)),
+        RequestBody::ListSms => {
+            run_modem(exec, |ex| ex.list_sms().map(|m| json!({ "messages": m })))
+        }
+        RequestBody::ReadSms { index } => {
+            run_modem(exec, |ex| ex.read_sms(index).map(|m| json!({ "message": m })))
+        }
+        RequestBody::DeleteSms { index } => {
+            run_modem(exec, |ex| ex.delete_sms(index).map(|()| json!({})))
+        }
+    };
+
+    let (resp, ok, error_code) = match result {
+        Ok(payload) => (api::ok_json(id, payload), true, None),
+        Err(e) => {
+            if let Ok(s) = store.lock() {
+                let _ = s.record_error(&now_iso(), "error", op_name, &e.message, rowid);
+            }
+            let code = e.code.clone();
+            (api::error_json(id, &e), false, Some(code))
+        }
+    };
+
+    if let Some(rid) = rowid {
+        let duration = started.elapsed().as_millis() as i64;
+        let _ = store.lock().unwrap().finish_request(
+            rid,
+            &now_iso(),
+            ok,
+            &resp.to_string(),
+            error_code.as_deref(),
+            duration,
+        );
     }
 
-    // --- Step 2: Check SIM PIN state ---
-    log("BOOT", "Checking SIM PIN state (AT+CPIN?)");
-    let resp = send_at_command(port, "AT+CPIN?", CMD_TIMEOUT_MS)?;
-    log("MODEM", resp.trim());
-
-    if resp.contains("+CPIN: SIM PIN") {
-        // --- Step 3: Unlock SIM with PIN from environment ---
-        let pin = std::env::var("MODEM_PIN1").map_err(|_| {
-            "SIM PIN required but MODEM_PIN1 environment variable is not set".to_string()
-        })?;
-
-        // Log the command without exposing the actual PIN value.
-        log("BOOT", "SIM PIN required – sending unlock command (AT+CPIN=****)");
-        let unlock_cmd = format!("AT+CPIN={}", pin);
-        let resp = send_at_command(port, &unlock_cmd, CMD_TIMEOUT_MS)?;
-        log("MODEM", resp.trim());
-
-        if !resp.contains("OK") {
-            return Err(
-                "SIM PIN unlock command rejected – check the MODEM_PIN1 value".to_string()
-            );
-        }
-
-        // Allow the modem to process the PIN and register to the network.
-        log("BOOT", "PIN accepted – waiting for SIM to become ready …");
-        thread::sleep(Duration::from_millis(PIN_SETTLE_MS));
-
-        // Confirm the SIM is now in the READY state.
-        let resp = send_at_command(port, "AT+CPIN?", CMD_TIMEOUT_MS)?;
-        log("MODEM", resp.trim());
-        if !resp.contains("+CPIN: READY") {
-            return Err(format!(
-                "SIM did not reach READY state after PIN entry. Response: {}",
-                resp.trim()
-            ));
-        }
-    } else if !resp.contains("+CPIN: READY") {
-        return Err(format!(
-            "Unexpected SIM state – expected READY. Response: {}",
-            resp.trim()
-        ));
-    }
-
-    log("BOOT", "Health check passed – modem and SIM are ready.");
-    Ok(())
+    resp
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-fn main() {
-    // Resolve the serial port path from the environment.
-    let port_name = std::env::var("MODEM_AT_PORT").unwrap_or_else(|_| {
-        log("ERROR", "MODEM_AT_PORT environment variable is not set.");
-        std::process::exit(1);
-    });
-
-    // Open the serial port.
-    let mut port = serialport::new(&port_name, BAUD_RATE)
-        .timeout(Duration::from_millis(200))
-        .open()
-        .unwrap_or_else(|e| {
-            log(
-                "ERROR",
-                &format!("Failed to open {}: {}. Is the modem connected?", port_name, e),
-            );
-            std::process::exit(1);
-        });
-
-    log("INFO", &format!("Connected to {} at {} baud", port_name, BAUD_RATE));
-
-    // Run the bootstrap health-check before accepting any commands.
-    if let Err(e) = health_check(&mut port) {
-        log("ERROR", &format!("Health check failed: {}", e));
-        std::process::exit(1);
+/// Lock the executor and run a modem op, or fail with `modem_not_ready`.
+fn run_modem<F>(exec: &SharedExec, f: F) -> Result<Value, ApiError>
+where
+    F: FnOnce(&mut ModemExecutor) -> Result<Value, ApiError>,
+{
+    let mut guard = exec.lock().unwrap();
+    match guard.as_mut() {
+        Some(ex) => f(ex),
+        None => Err(ApiError::modem_not_ready()),
     }
+}
 
-    log("INFO", "Ready – type AT commands below (or !DTR_LOW / !DTR_HIGH).");
-
-    // Split the port into a reader half (background thread) and a writer half
-    // (main thread, driven by STDIN).
-    let mut reader = port.try_clone().expect("Failed to clone port for reading");
-    let mut writer = port;
-
-    // Background thread: modem → STDOUT
-    thread::spawn(move || {
-        let mut buf = [0u8; 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let text = String::from_utf8_lossy(&buf[..n]);
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            log("MODEM", trimmed);
-                        }
-                    }
-                }
-                _ => {}
-            }
+fn health_value(status: &SharedStatus, store: &SharedStore) -> Value {
+    let st = status.lock().unwrap();
+    let recent_errors = store.lock().unwrap().error_count();
+    json!({
+        "status": {
+            "modem": st.modem,
+            "sim": st.sim,
+            "started_at": st.started_at,
+            "uptime_s": st.start.elapsed().as_secs(),
+            "recent_errors": recent_errors,
         }
-    });
+    })
+}
 
-    // Main thread: STDIN → modem
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let input = line.expect("Failed to read from STDIN");
-        let cmd = input.trim();
-
-        if cmd.is_empty() {
-            continue;
-        }
-
-        match cmd {
-            "!DTR_LOW" => {
-                writer
-                    .write_data_terminal_ready(true)
-                    .expect("Failed to assert DTR");
-                log("DTR", "Asserted (physical LOW / wake signal)");
-            }
-            "!DTR_HIGH" => {
-                writer
-                    .write_data_terminal_ready(false)
-                    .expect("Failed to de-assert DTR");
-                log("DTR", "De-asserted (physical HIGH / sleep signal)");
-            }
-            _ => {
-                log("CMD", cmd);
-                let at_cmd = format!("{}\r\n", cmd);
-                writer
-                    .write_all(at_cmd.as_bytes())
-                    .expect("Failed to write to modem");
-            }
-        }
+/// Record a request that failed to parse (before dispatch) as one audited row.
+fn record_parse_failure(
+    store: &SharedStore,
+    ts_received: &str,
+    peer: &str,
+    id: Option<i64>,
+    params_json: &str,
+    e: &ApiError,
+    started: Instant,
+) {
+    let Ok(s) = store.lock() else { return };
+    if let Ok(rid) = s.insert_request(ts_received, peer, id, "invalid", params_json) {
+        let duration = started.elapsed().as_millis() as i64;
+        let resp = api::error_json(id, e).to_string();
+        let _ = s.finish_request(rid, &now_iso(), false, &resp, Some(&e.code), duration);
+        let _ = s.record_error(&now_iso(), "warn", "invalid", &e.message, Some(rid));
     }
 }
