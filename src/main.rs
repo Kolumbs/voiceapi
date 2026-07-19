@@ -23,7 +23,7 @@ use store::Store;
 
 /// Cached service/modem status, reported by `health` without touching the modem.
 struct Status {
-    modem: String, // "ready" | "not_ready"
+    modem: String, // "initializing" | "ready" | "not_ready"
     sim: String,   // "READY" | "unknown"
     started_at: String,
     start: Instant,
@@ -62,16 +62,20 @@ fn main() {
     };
 
     let status: SharedStatus = Arc::new(Mutex::new(Status {
-        modem: "not_ready".to_string(),
+        modem: "initializing".to_string(),
         sim: "unknown".to_string(),
         started_at: now_iso(),
         start: Instant::now(),
     }));
 
-    // 3. Modem bring-up — non-fatal. On failure the service still serves
-    //    `health` (reporting modem: not_ready); the error is recorded in SQLite.
+    // 3. Modem bring-up — non-fatal and **off the accept path**. It must not run
+    //    synchronously here: bind() already makes the kernel queue inbound
+    //    connections, so any time spent talking to the modem before the accept
+    //    loop starts leaves clients connected but unanswered (an unresponsive
+    //    modem can take ~50s of AT timeouts). Running it on its own thread keeps
+    //    `health` answerable from the first moment.
     let exec: SharedExec = Arc::new(Mutex::new(None));
-    bring_up(&store, &status, &exec);
+    spawn_bring_up(store.clone(), status.clone(), exec.clone());
 
     // Occupancy gate: only one client may hold a connection at a time.
     let busy = Arc::new(AtomicBool::new(false));
@@ -84,35 +88,38 @@ fn main() {
     }
 }
 
-/// Open the port and run health-check + SMS init; record any failure and leave
-/// `exec` as `None` (modem ops will then return `modem_not_ready`).
-fn bring_up(store: &SharedStore, status: &SharedStatus, exec: &SharedExec) {
-    let record = |msg: &str| {
-        if let Ok(s) = store.lock() {
-            let _ = s.record_error(&now_iso(), "error", "bringup", msg, None);
+/// Open the port, unlock the SIM and put the modem into a known SMS state.
+fn bring_up_modem() -> Result<ModemExecutor, String> {
+    let port_name =
+        std::env::var("MODEM_AT_PORT").map_err(|_| "MODEM_AT_PORT is not set".to_string())?;
+    let mut port = serial::open_port(&port_name)?;
+    serial::health_check(&mut port)?;
+    serial::sms_init(&mut port)?;
+    Ok(ModemExecutor::new(port))
+}
+
+/// Run bring-up on its own thread and publish the outcome. Until it finishes,
+/// `health` reports `modem: initializing` and modem ops return `modem_not_ready`.
+fn spawn_bring_up(store: SharedStore, status: SharedStatus, exec: SharedExec) {
+    thread::spawn(move || match bring_up_modem() {
+        Ok(executor) => {
+            if let Ok(mut st) = status.lock() {
+                st.modem = "ready".to_string();
+                st.sim = "READY".to_string();
+            }
+            if let Ok(mut guard) = exec.lock() {
+                *guard = Some(executor);
+            }
         }
-    };
-
-    let port_name = match std::env::var("MODEM_AT_PORT") {
-        Ok(p) => p,
-        Err(_) => return record("MODEM_AT_PORT is not set"),
-    };
-    let mut port = match serial::open_port(&port_name) {
-        Ok(p) => p,
-        Err(e) => return record(&e),
-    };
-    if let Err(e) = serial::health_check(&mut port) {
-        return record(&e);
-    }
-    if let Err(e) = serial::sms_init(&mut port) {
-        return record(&e);
-    }
-
-    if let Ok(mut st) = status.lock() {
-        st.modem = "ready".to_string();
-        st.sim = "READY".to_string();
-    }
-    *exec.lock().unwrap() = Some(ModemExecutor::new(port));
+        Err(e) => {
+            if let Ok(mut st) = status.lock() {
+                st.modem = "not_ready".to_string();
+            }
+            if let Ok(s) = store.lock() {
+                let _ = s.record_error(&now_iso(), "error", "bringup", &e, None);
+            }
+        }
+    });
 }
 
 fn handle_connection(

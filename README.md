@@ -40,8 +40,10 @@ bodies are handled in text mode (`AT+CMGF=1`).
 | `VOICEAPI_TCP_ADDR` | WebSocket listener bind address | `127.0.0.1:9500` |
 | `VOICEAPI_DB` | SQLite database path | `./voiceapi.db` |
 
-Modem bring-up is non-fatal: if the modem is unavailable the service still runs
-and `health` reports `modem: not_ready`.
+Modem bring-up runs on a background thread, so the listener answers `health`
+immediately at startup. It is also non-fatal: `health` reports `modem` as
+`initializing` while it runs, then `ready`, or `not_ready` if it failed (the
+reason is recorded in the `errors` table).
 
 ## Build & run
 
