@@ -42,7 +42,6 @@ pub fn open_port(port_name: &str) -> Result<Port, String> {
 pub fn send_at_command(port: &mut Port, command: &str, timeout_ms: u64) -> Result<String, String> {
     let cmd = format!("{command}\r\n");
     port.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
-    port.flush().map_err(|e| e.to_string())?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut response = String::new();

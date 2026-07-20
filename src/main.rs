@@ -68,12 +68,8 @@ fn main() {
         start: Instant::now(),
     }));
 
-    // 3. Modem bring-up — non-fatal and **off the accept path**. It must not run
-    //    synchronously here: bind() already makes the kernel queue inbound
-    //    connections, so any time spent talking to the modem before the accept
-    //    loop starts leaves clients connected but unanswered (an unresponsive
-    //    modem can take ~50s of AT timeouts). Running it on its own thread keeps
-    //    `health` answerable from the first moment.
+    // 3. Modem bring-up — non-fatal, and off the accept path so `health` stays
+    //    answerable while the modem initializes.
     let exec: SharedExec = Arc::new(Mutex::new(None));
     spawn_bring_up(store.clone(), status.clone(), exec.clone());
 
