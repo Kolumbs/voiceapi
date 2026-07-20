@@ -86,3 +86,26 @@ VOICEAPI_DB=/var/lib/voiceapi/voiceapi.db \
 ```
 
 `cargo test` covers the SMS response parsing (`+CMGL` / `+CMGR` / SCTS).
+
+## Client
+
+A dependency-free client ships with the repo — standard library only, so it runs
+on the Pi with nothing to install. Run it from the repo root:
+
+```sh
+python3 -m voiceapi health
+python3 -m voiceapi read_sms   -d '{"index": 3}'
+python3 -m voiceapi set_config -d '{"at_port": "/dev/ttyUSB5", "pin": "1234"}'
+python3 -m voiceapi reconnect
+python3 -m voiceapi list_errors -d '{"limit": 5}'
+```
+
+`-d` takes a JSON object merged into the request. The endpoint defaults to
+`ws://127.0.0.1:9500/` and is overridable with `--url` (or `VOICEAPI_URL`);
+`wss://` is supported for going through the TLS reverse proxy. The operation name
+is passed straight through, so the client needs no update when the server gains an
+op. Exit status is 0 when the response is `ok`, 1 otherwise — so it scripts:
+
+```sh
+python3 -m voiceapi health >/dev/null || echo "voiceapi is unhappy"
+```
