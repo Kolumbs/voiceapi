@@ -3,6 +3,7 @@
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::os::unix::fs::PermissionsExt;
 
 /// One row of the error log, shaped exactly like the `errors` table so the API
 /// view and the database read identically.
@@ -38,18 +39,72 @@ CREATE TABLE IF NOT EXISTS errors (
   message   TEXT NOT NULL,
   req_rowid INTEGER REFERENCES requests(rowid)
 );
+CREATE TABLE IF NOT EXISTS config (
+  id      INTEGER PRIMARY KEY CHECK (id = 1),
+  at_port TEXT,
+  pin     TEXT
+);
 ";
+
+/// Modem configuration, persisted so the service comes up unattended.
+#[derive(Default)]
+pub struct ModemConfig {
+    pub at_port: Option<String>,
+    pub pin: Option<String>,
+}
 
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
-    /// Open (creating if needed) the database and apply migrations.
+    /// Open (creating if needed) the database and apply migrations. The file is
+    /// restricted to 0600 because it stores the SIM PIN.
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot restrict permissions on {path}: {e}"))?;
         Ok(Self { conn })
+    }
+
+    /// Current modem configuration (empty if never set).
+    pub fn get_config(&self) -> Result<ModemConfig, String> {
+        self.conn
+            .query_row(
+                "SELECT at_port, pin FROM config WHERE id = 1",
+                [],
+                |r| Ok(ModemConfig { at_port: r.get(0)?, pin: r.get(1)? }),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(ModemConfig::default()),
+                other => Err(other.to_string()),
+            })
+    }
+
+    /// Update configuration. `None` leaves a field unchanged; `Some("")` clears it.
+    pub fn set_config(&self, at_port: Option<&str>, pin: Option<&str>) -> Result<(), String> {
+        // Outer Option = "was this field supplied"; inner = the value, where an
+        // empty string means "clear it".
+        fn norm(v: Option<&str>) -> Option<Option<&str>> {
+            v.map(|s| if s.is_empty() { None } else { Some(s) })
+        }
+        let (at_port, pin) = (norm(at_port), norm(pin));
+        self.conn
+            .execute(
+                "INSERT INTO config (id, at_port, pin) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                   at_port = CASE WHEN ?3 THEN ?1 ELSE at_port END,
+                   pin     = CASE WHEN ?4 THEN ?2 ELSE pin     END",
+                params![
+                    at_port.flatten(),
+                    pin.flatten(),
+                    at_port.is_some(),
+                    pin.is_some()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Record an incoming request; returns its rowid for later completion.

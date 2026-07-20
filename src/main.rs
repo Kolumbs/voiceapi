@@ -19,7 +19,7 @@ use tungstenite::Message;
 use api::{ApiError, RequestBody};
 use serial::fatal;
 use sms::ModemExecutor;
-use store::Store;
+use store::{ModemConfig, Store};
 
 /// Cached service/modem status, reported by `health` without touching the modem.
 struct Status {
@@ -71,60 +71,109 @@ fn main() {
     // 3. Modem bring-up — non-fatal, and off the accept path so `health` stays
     //    answerable while the modem initializes.
     let exec: SharedExec = Arc::new(Mutex::new(None));
-    spawn_bring_up(store.clone(), status.clone(), exec.clone());
+    let bringing_up = Arc::new(AtomicBool::new(false));
+    spawn_bring_up(
+        store.clone(),
+        status.clone(),
+        exec.clone(),
+        bringing_up.clone(),
+    );
 
     // Occupancy gate: only one client may hold a connection at a time.
     let busy = Arc::new(AtomicBool::new(false));
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let (store, status, exec, busy) =
-            (store.clone(), status.clone(), exec.clone(), busy.clone());
-        thread::spawn(move || handle_connection(stream, store, status, exec, busy));
+        let ctx = Ctx {
+            store: store.clone(),
+            status: status.clone(),
+            exec: exec.clone(),
+            bringing_up: bringing_up.clone(),
+        };
+        let busy = busy.clone();
+        thread::spawn(move || handle_connection(stream, ctx, busy));
     }
 }
 
+/// Shared state handed to each connection.
+#[derive(Clone)]
+struct Ctx {
+    store: SharedStore,
+    status: SharedStatus,
+    exec: SharedExec,
+    bringing_up: Arc<AtomicBool>,
+}
+
 /// Open the port, unlock the SIM and put the modem into a known SMS state.
-fn bring_up_modem() -> Result<ModemExecutor, String> {
-    let port_name =
-        std::env::var("MODEM_AT_PORT").map_err(|_| "MODEM_AT_PORT is not set".to_string())?;
-    let mut port = serial::open_port(&port_name)?;
-    serial::health_check(&mut port)?;
+fn bring_up_modem(cfg: &ModemConfig) -> Result<ModemExecutor, String> {
+    let port_name = cfg
+        .at_port
+        .as_deref()
+        .ok_or_else(|| "AT port is not configured".to_string())?;
+    let mut port = serial::open_port(port_name)?;
+    serial::health_check(&mut port, cfg.pin.as_deref())?;
     serial::sms_init(&mut port)?;
     Ok(ModemExecutor::new(port))
 }
 
 /// Run bring-up on its own thread and publish the outcome. Until it finishes,
 /// `health` reports `modem: initializing` and modem ops return `modem_not_ready`.
-fn spawn_bring_up(store: SharedStore, status: SharedStatus, exec: SharedExec) {
-    thread::spawn(move || match bring_up_modem() {
-        Ok(executor) => {
-            if let Ok(mut st) = status.lock() {
-                st.modem = "ready".to_string();
-                st.sim = "READY".to_string();
-            }
-            if let Ok(mut guard) = exec.lock() {
-                *guard = Some(executor);
-            }
-        }
-        Err(e) => {
-            if let Ok(mut st) = status.lock() {
-                st.modem = "not_ready".to_string();
-            }
-            if let Ok(s) = store.lock() {
-                let _ = s.record_error(&now_iso(), "error", "bringup", &e, None);
-            }
-        }
-    });
-}
-
-fn handle_connection(
-    stream: TcpStream,
+/// Returns false if an attempt is already running.
+fn spawn_bring_up(
     store: SharedStore,
     status: SharedStatus,
     exec: SharedExec,
-    busy: Arc<AtomicBool>,
-) {
+    in_progress: Arc<AtomicBool>,
+) -> bool {
+    if in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    thread::spawn(move || {
+        if let Ok(mut st) = status.lock() {
+            st.modem = "initializing".to_string();
+            st.sim = "unknown".to_string();
+        }
+        // Drop any existing handle before reopening: serialport takes an exclusive
+        // flock, so the old one would block reopening the same device.
+        if let Ok(mut guard) = exec.lock() {
+            *guard = None;
+        }
+
+        let cfg = store.lock().map_or_else(
+            |_| Err("config unavailable".to_string()),
+            |s| s.get_config(),
+        );
+
+        let outcome = cfg.and_then(|cfg| bring_up_modem(&cfg));
+        match outcome {
+            Ok(executor) => {
+                if let Ok(mut st) = status.lock() {
+                    st.modem = "ready".to_string();
+                    st.sim = "READY".to_string();
+                }
+                if let Ok(mut guard) = exec.lock() {
+                    *guard = Some(executor);
+                }
+            }
+            Err(e) => {
+                if let Ok(mut st) = status.lock() {
+                    st.modem = "not_ready".to_string();
+                }
+                if let Ok(s) = store.lock() {
+                    let _ = s.record_error(&now_iso(), "error", "bringup", &e, None);
+                }
+            }
+        }
+        in_progress.store(false, Ordering::Release);
+    });
+    true
+}
+
+fn handle_connection(stream: TcpStream, ctx: Ctx, busy: Arc<AtomicBool>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -149,7 +198,7 @@ fn handle_connection(
     loop {
         match ws.read() {
             Ok(Message::Text(t)) => {
-                let resp = process_message(t.as_str(), &peer, &store, &status, &exec);
+                let resp = process_message(t.as_str(), &peer, &ctx);
                 if ws.send(Message::text(resp.to_string())).is_err() {
                     break;
                 }
@@ -163,29 +212,26 @@ fn handle_connection(
 }
 
 /// Parse, execute, persist, and produce the JSON response for one request.
-fn process_message(
-    text: &str,
-    peer: &str,
-    store: &SharedStore,
-    status: &SharedStatus,
-    exec: &SharedExec,
-) -> Value {
+fn process_message(text: &str, peer: &str, ctx: &Ctx) -> Value {
+    let (store, status, exec) = (&ctx.store, &ctx.status, &ctx.exec);
     let started = Instant::now();
     let ts_received = now_iso();
 
     let (id, body) = match api::parse_request(text) {
         Ok(v) => v,
         Err((id, e)) => {
-            record_parse_failure(store, &ts_received, peer, id, text, &e, started);
+            let safe = api::audit_unparsed(text);
+            record_parse_failure(store, &ts_received, peer, id, &safe, &e, started);
             return api::error_json(id, &e);
         }
     };
 
     let op_name = body.op_name();
+    let audit = api::audit_params(&body, text);
     let rowid = store
         .lock()
         .unwrap()
-        .insert_request(&ts_received, peer, id, op_name, text)
+        .insert_request(&ts_received, peer, id, op_name, &audit)
         .ok();
 
     let result: Result<Value, ApiError> = match body {
@@ -207,6 +253,29 @@ fn process_message(
             .recent_errors(limit.min(api::MAX_ERROR_LIMIT))
             .map(|errors| json!({ "errors": errors }))
             .map_err(ApiError::storage),
+        RequestBody::GetConfig => config_json(&store.lock().unwrap()),
+        // One lock for both the write and the read-back: std::sync::Mutex is not
+        // reentrant, so re-locking here would deadlock the connection thread.
+        RequestBody::SetConfig { at_port, pin } => {
+            let s = store.lock().unwrap();
+            s.set_config(at_port.as_deref(), pin.as_deref())
+                .map_err(ApiError::storage)
+                .and_then(|()| config_json(&s))
+        }
+        // Asynchronous: bring-up can take ~50s, and this connection is the only
+        // one served, so the client polls `health` instead of blocking here.
+        RequestBody::Reconnect => {
+            if spawn_bring_up(
+                store.clone(),
+                status.clone(),
+                exec.clone(),
+                ctx.bringing_up.clone(),
+            ) {
+                Ok(health_value(status))
+            } else {
+                Err(ApiError::busy("bring-up already in progress"))
+            }
+        }
     };
 
     let (resp, ok, error_code) = match result {
@@ -245,6 +314,18 @@ where
         Some(ex) => f(ex),
         None => Err(ApiError::modem_not_ready()),
     }
+}
+
+/// Configuration as exposed to clients — the PIN is never returned, only whether
+/// one is set. Takes an already-locked `Store` so callers control the lock.
+fn config_json(s: &Store) -> Result<Value, ApiError> {
+    let cfg = s.get_config().map_err(ApiError::storage)?;
+    Ok(json!({
+        "config": {
+            "at_port": cfg.at_port,
+            "pin_set": cfg.pin.is_some(),
+        }
+    }))
 }
 
 /// Liveness only: is the modem ready. Diagnostic detail lives in `list_errors`.

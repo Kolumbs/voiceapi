@@ -74,8 +74,9 @@ pub fn send_at_command(port: &mut Port, command: &str, timeout_ms: u64) -> Resul
 }
 
 /// Bootstrap health-check: enable network time-zone sync and ensure the SIM is
-/// unlocked and READY. Returns `Ok(())` when the SIM is ready.
-pub fn health_check(port: &mut Port) -> Result<(), String> {
+/// unlocked and READY. `pin` is only used if the modem reports `+CPIN: SIM PIN`,
+/// so a wrong PIN costs at most one of the SIM's three attempts per call.
+pub fn health_check(port: &mut Port, pin: Option<&str>) -> Result<(), String> {
     // Enable automatic time-zone update from the network.
     let resp = send_at_command(port, "AT+CTZU=1", CMD_TIMEOUT_MS)?;
     if !resp.contains("OK") {
@@ -86,12 +87,11 @@ pub fn health_check(port: &mut Port) -> Result<(), String> {
     let resp = send_at_command(port, "AT+CPIN?", CMD_TIMEOUT_MS)?;
 
     if resp.contains("+CPIN: SIM PIN") {
-        let pin = std::env::var("MODEM_PIN1")
-            .map_err(|_| "SIM PIN required but MODEM_PIN1 is not set".to_string())?;
+        let pin = pin.ok_or_else(|| "SIM PIN required but no PIN is configured".to_string())?;
 
         let resp = send_at_command(port, &format!("AT+CPIN={pin}"), CMD_TIMEOUT_MS)?;
         if !resp.contains("OK") {
-            return Err("SIM PIN unlock rejected — check MODEM_PIN1".to_string());
+            return Err("SIM PIN unlock rejected — check the configured PIN".to_string());
         }
 
         // Allow the modem to process the PIN and register to the network.

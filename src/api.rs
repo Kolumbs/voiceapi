@@ -32,6 +32,9 @@ impl ApiError {
     pub fn storage(message: impl Into<String>) -> Self {
         Self::new("storage_error", message)
     }
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new("busy", message)
+    }
     pub fn already_connected() -> Self {
         Self::new("already_connected", "another client is already connected")
     }
@@ -59,6 +62,14 @@ pub enum RequestBody {
         #[serde(default = "default_error_limit")]
         limit: u32,
     },
+    GetConfig,
+    SetConfig {
+        #[serde(default)]
+        at_port: Option<String>,
+        #[serde(default)]
+        pin: Option<String>,
+    },
+    Reconnect,
 }
 
 impl RequestBody {
@@ -70,6 +81,9 @@ impl RequestBody {
             RequestBody::DeleteSms { .. } => "delete_sms",
             RequestBody::Health => "health",
             RequestBody::ListErrors { .. } => "list_errors",
+            RequestBody::GetConfig => "get_config",
+            RequestBody::SetConfig { .. } => "set_config",
+            RequestBody::Reconnect => "reconnect",
         }
     }
 }
@@ -86,6 +100,30 @@ pub fn parse_request(text: &str) -> Result<(Option<i64>, RequestBody), (Option<i
     match serde_json::from_value::<RequestBody>(value) {
         Ok(body) => Ok((id, body)),
         Err(e) => Err((id, ApiError::bad_request(e.to_string()))),
+    }
+}
+
+/// Audit-safe rendering of a parsed request. A SIM PIN must never be written to
+/// the `requests` table, so `set_config` is reconstructed with the value elided.
+pub fn audit_params(body: &RequestBody, raw: &str) -> String {
+    match body {
+        RequestBody::SetConfig { at_port, pin } => json!({
+            "op": "set_config",
+            "at_port": at_port,
+            "pin": pin.as_ref().map(|_| "<redacted>"),
+        })
+        .to_string(),
+        _ => raw.to_string(),
+    }
+}
+
+/// Audit-safe rendering of text that failed to parse: if it mentions a PIN at all
+/// we cannot know its shape, so store nothing of it.
+pub fn audit_unparsed(raw: &str) -> String {
+    if raw.to_lowercase().contains("pin") {
+        "<redacted: unparseable request>".to_string()
+    } else {
+        raw.to_string()
     }
 }
 
