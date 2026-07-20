@@ -9,6 +9,7 @@
 use serialport::SerialPort;
 use std::io::Read;
 use std::io::Write;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,12 +32,46 @@ pub fn fatal(context: &str, message: &str) {
     eprintln!("[{ts}][FATAL][{context}] {message}");
 }
 
+/// Wall-clock budget for opening a port. `serialport`'s open runs termios ioctls
+/// that ignore the read/write timeout and can block uninterruptibly on a wedged
+/// USB endpoint, so the open itself must be bounded.
+pub const OPEN_TIMEOUT_MS: u64 = 5_000;
+
 /// Open the modem's AT serial port by explicit path (no enumeration).
-pub fn open_port(port_name: &str) -> Result<Port, String> {
+fn open_port_raw(port_name: &str) -> Result<Port, String> {
     serialport::new(port_name, BAUD_RATE)
         .timeout(Duration::from_millis(200))
         .open()
         .map_err(|e| format!("failed to open {port_name}: {e}"))
+}
+
+/// Open a port with a hard wall-clock timeout. If the open does not complete in
+/// [`OPEN_TIMEOUT_MS`] the worker thread is abandoned (it may be stuck in an
+/// uninterruptible syscall) and an error is returned, so one bad device cannot
+/// hang the caller.
+pub fn open_port(port_name: &str) -> Result<Port, String> {
+    let name = port_name.to_string();
+    match run_with_timeout(Duration::from_millis(OPEN_TIMEOUT_MS), move || {
+        open_port_raw(&name)
+    }) {
+        Ok(res) => res,
+        Err(()) => Err(format!("timed out opening {port_name} (device not responding)")),
+    }
+}
+
+/// Run `f` on a worker thread, returning its value, or `Err(())` if it does not
+/// finish within `timeout`. On timeout the worker is left running (and its result
+/// dropped when it eventually finishes), which is the price of not blocking here.
+pub fn run_with_timeout<T, F>(timeout: Duration, f: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).map_err(|_| ())
 }
 
 /// Send `command` (without terminator) and collect the full response up to the
@@ -129,4 +164,30 @@ pub fn sms_init(port: &mut Port) -> Result<(), String> {
         return Err("failed to suppress SMS indications (AT+CNMI)".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_with_timeout_returns_value() {
+        assert_eq!(run_with_timeout(Duration::from_secs(2), || 42), Ok(42));
+    }
+
+    #[test]
+    fn run_with_timeout_times_out_on_a_slow_task() {
+        let r = run_with_timeout(Duration::from_millis(100), || {
+            thread::sleep(Duration::from_secs(3));
+            1
+        });
+        assert_eq!(r, Err(()));
+    }
+
+    #[test]
+    fn open_port_bounds_a_nonexistent_device() {
+        // A missing device fails fast (not a timeout), proving the happy path is
+        // unaffected by the wrapper.
+        assert!(open_port("/dev/voiceapi-does-not-exist").is_err());
+    }
 }
