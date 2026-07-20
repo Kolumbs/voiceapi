@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 pub const BAUD_RATE: u32 = 115200;
 /// Timeout for a single synchronous AT command round-trip.
 pub const CMD_TIMEOUT_MS: u64 = 10_000;
+/// Shorter timeout for the `at` connectivity probe: a live modem answers in
+/// milliseconds, and probing several candidate ports should not take a minute.
+pub const AT_PROBE_TIMEOUT_MS: u64 = 3_000;
 /// How long to wait after sending a PIN before re-checking CPIN state.
 const PIN_SETTLE_MS: u64 = 3_000;
 

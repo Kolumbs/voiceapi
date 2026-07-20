@@ -70,6 +70,12 @@ pub enum RequestBody {
         pin: Option<String>,
     },
     Reconnect,
+    /// Connectivity probe. Optionally targets a port without committing it to
+    /// config, so candidate interfaces can be tried before `set_config`.
+    Check {
+        #[serde(default)]
+        at_port: Option<String>,
+    },
 }
 
 impl RequestBody {
@@ -84,6 +90,7 @@ impl RequestBody {
             RequestBody::GetConfig => "get_config",
             RequestBody::SetConfig { .. } => "set_config",
             RequestBody::Reconnect => "reconnect",
+            RequestBody::Check { .. } => "check",
         }
     }
 }

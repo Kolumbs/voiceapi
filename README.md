@@ -28,6 +28,7 @@ Requests carry a client-chosen `id` echoed back on the response.
 | `{"id":6,"op":"get_config"}` | `{"id":6,"ok":true,"config":{"at_port":"/dev/ttyUSB2","pin_set":true}}` |
 | `{"id":7,"op":"set_config","at_port":"...","pin":"1234"}` | same shape as `get_config` |
 | `{"id":8,"op":"reconnect"}` | `{"id":8,"ok":true,"status":{...}}` |
+| `{"id":9,"op":"check","at_port":"/dev/ttyUSB2"}` | `{"id":9,"ok":true,"check":{"port":"...","reply":"OK"}}` |
 
 Errors: `{"id":N,"ok":false,"error":{"code":"...","message":"..."}}`
 (`bad_request`, `not_found`, `modem_error`, `modem_not_ready`, `storage_error`,
@@ -65,8 +66,27 @@ The service starts with no modem configuration and reports `modem: not_ready`
 Config persists across restarts. `set_config` only changes the fields you supply;
 `""` clears one. `reconnect` re-runs bring-up **asynchronously** (it can take ~50s
 against an unresponsive modem) — poll `health` for the outcome, and a second
-concurrent attempt returns `busy`. This is also the quick way to find the right
-AT interface: `set_config` a candidate port, `reconnect`, check `health`.
+concurrent attempt returns `busy`.
+
+### Finding the AT port
+
+A module usually exposes several `ttyUSB` interfaces and only one answers AT
+commands — and the numbering moves between reboots. `check` sends a fixed `AT`
+(it is a reachability test, not AT passthrough) and reports the reply. Given
+`at_port` it probes that device **without** changing the configuration, and it
+works while the modem is `not_ready`, so candidates can be tried before
+committing one. It fails in ~3s rather than the usual 10s timeout:
+
+```sh
+for p in /dev/ttyUSB*; do
+  python3 -m voiceapi check -d "{\"at_port\": \"$p\"}" >/dev/null 2>&1 \
+    && echo "$p answers"
+done
+```
+
+Then `set_config` the winner and `reconnect`. With no `at_port`, `check` probes
+the configured port — reusing the live handle when the modem is already up, since
+the device cannot be opened twice.
 
 The PIN is never returned by the API (`get_config` reports only `pin_set`) and is
 redacted from the request audit log. Since the database stores it, the file is

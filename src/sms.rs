@@ -3,7 +3,7 @@
 //! of the program only ever calls `list_sms` / `read_sms` / `delete_sms`.
 
 use crate::api::ApiError;
-use crate::serial::{send_at_command, Port, CMD_TIMEOUT_MS};
+use crate::serial::{self, send_at_command, Port, CMD_TIMEOUT_MS};
 use chrono::{FixedOffset, NaiveDate, NaiveTime, TimeZone};
 use serde::Serialize;
 
@@ -20,11 +20,23 @@ pub struct SmsMessage {
 /// Owns the serial port and runs one AT sequence at a time.
 pub struct ModemExecutor {
     port: Port,
+    port_name: String,
 }
 
 impl ModemExecutor {
-    pub fn new(port: Port) -> Self {
-        Self { port }
+    pub fn new(port: Port, port_name: String) -> Self {
+        Self { port, port_name }
+    }
+
+    pub fn port_name(&self) -> &str {
+        &self.port_name
+    }
+
+    /// Fixed `AT` connectivity probe over the already-open port.
+    pub fn check(&mut self) -> Result<String, ApiError> {
+        let resp = send_at_command(&mut self.port, "AT", serial::AT_PROBE_TIMEOUT_MS)
+            .map_err(ApiError::modem)?;
+        Ok(resp.trim().to_string())
     }
 
     pub fn list_sms(&mut self) -> Result<Vec<SmsMessage>, ApiError> {

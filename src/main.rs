@@ -113,7 +113,7 @@ fn bring_up_modem(cfg: &ModemConfig) -> Result<ModemExecutor, String> {
     let mut port = serial::open_port(port_name)?;
     serial::health_check(&mut port, cfg.pin.as_deref())?;
     serial::sms_init(&mut port)?;
-    Ok(ModemExecutor::new(port))
+    Ok(ModemExecutor::new(port, port_name.to_string()))
 }
 
 /// Run bring-up on its own thread and publish the outcome. Until it finishes,
@@ -264,6 +264,7 @@ fn process_message(text: &str, peer: &str, ctx: &Ctx) -> Value {
         }
         // Asynchronous: bring-up can take ~50s, and this connection is the only
         // one served, so the client polls `health` instead of blocking here.
+        RequestBody::Check { at_port } => check_modem(store, exec, at_port),
         RequestBody::Reconnect => {
             if spawn_bring_up(
                 store.clone(),
@@ -314,6 +315,42 @@ where
         Some(ex) => f(ex),
         None => Err(ApiError::modem_not_ready()),
     }
+}
+
+/// Connectivity probe: send a fixed `AT` and report the reply. The command is not
+/// client-supplied — this is a reachability test, not AT passthrough.
+///
+/// Works while the modem is `not_ready`, which is the point: it is how you find
+/// which interface answers before committing it with `set_config`. When the modem
+/// is up the existing handle is reused, since `serialport` holds an exclusive
+/// flock and the device cannot be opened twice.
+fn check_modem(
+    store: &SharedStore,
+    exec: &SharedExec,
+    at_port: Option<String>,
+) -> Result<Value, ApiError> {
+    let port_name = match at_port {
+        Some(p) => p,
+        None => {
+            if let Some(ex) = exec.lock().unwrap().as_mut() {
+                let reply = ex.check()?;
+                let port = ex.port_name().to_string();
+                return Ok(json!({ "check": { "port": port, "reply": reply } }));
+            }
+            store
+                .lock()
+                .unwrap()
+                .get_config()
+                .map_err(ApiError::storage)?
+                .at_port
+                .ok_or_else(|| ApiError::new("not_configured", "no AT port configured"))?
+        }
+    };
+
+    let mut port = serial::open_port(&port_name).map_err(ApiError::modem)?;
+    let reply = serial::send_at_command(&mut port, "AT", serial::AT_PROBE_TIMEOUT_MS)
+        .map_err(ApiError::modem)?;
+    Ok(json!({ "check": { "port": port_name, "reply": reply.trim() } }))
 }
 
 /// Configuration as exposed to clients — the PIN is never returned, only whether
