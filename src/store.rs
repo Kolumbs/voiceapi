@@ -2,6 +2,19 @@
 //! Uses the bundled SQLite (no system libsqlite3 dependency).
 
 use rusqlite::{params, Connection};
+use serde::Serialize;
+
+/// One row of the error log, shaped exactly like the `errors` table so the API
+/// view and the database read identically.
+#[derive(Serialize)]
+pub struct ErrorRow {
+    pub rowid: i64,
+    pub ts: String,
+    pub severity: String,
+    pub context: Option<String>,
+    pub message: String,
+    pub req_rowid: Option<i64>,
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS requests (
@@ -98,10 +111,27 @@ impl Store {
         Ok(())
     }
 
-    /// Total number of recorded errors (surfaced in `health`).
-    pub fn error_count(&self) -> i64 {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM errors", [], |r| r.get(0))
-            .unwrap_or(0)
+    /// Most recent errors, newest first.
+    pub fn recent_errors(&self, limit: u32) -> Result<Vec<ErrorRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rowid, ts, severity, context, message, req_rowid
+                 FROM errors ORDER BY rowid DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(ErrorRow {
+                    rowid: r.get(0)?,
+                    ts: r.get(1)?,
+                    severity: r.get(2)?,
+                    context: r.get(3)?,
+                    message: r.get(4)?,
+                    req_rowid: r.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 }

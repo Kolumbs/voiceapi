@@ -189,7 +189,7 @@ fn process_message(
         .ok();
 
     let result: Result<Value, ApiError> = match body {
-        RequestBody::Health => Ok(health_value(status, store)),
+        RequestBody::Health => Ok(health_value(status)),
         RequestBody::ListSms => {
             run_modem(exec, |ex| ex.list_sms().map(|m| json!({ "messages": m })))
         }
@@ -199,6 +199,14 @@ fn process_message(
         RequestBody::DeleteSms { index } => {
             run_modem(exec, |ex| ex.delete_sms(index).map(|()| json!({})))
         }
+        // Pure database read: no modem executor, so it still answers while the
+        // modem is not_ready — which is exactly when it is needed.
+        RequestBody::ListErrors { limit } => store
+            .lock()
+            .unwrap()
+            .recent_errors(limit.min(api::MAX_ERROR_LIMIT))
+            .map(|errors| json!({ "errors": errors }))
+            .map_err(ApiError::storage),
     };
 
     let (resp, ok, error_code) = match result {
@@ -239,16 +247,15 @@ where
     }
 }
 
-fn health_value(status: &SharedStatus, store: &SharedStore) -> Value {
+/// Liveness only: is the modem ready. Diagnostic detail lives in `list_errors`.
+fn health_value(status: &SharedStatus) -> Value {
     let st = status.lock().unwrap();
-    let recent_errors = store.lock().unwrap().error_count();
     json!({
         "status": {
             "modem": st.modem,
             "sim": st.sim,
             "started_at": st.started_at,
             "uptime_s": st.start.elapsed().as_secs(),
-            "recent_errors": recent_errors,
         }
     })
 }

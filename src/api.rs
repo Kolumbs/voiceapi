@@ -29,9 +29,21 @@ impl ApiError {
     pub fn modem_not_ready() -> Self {
         Self::new("modem_not_ready", "modem is not ready")
     }
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::new("storage_error", message)
+    }
     pub fn already_connected() -> Self {
         Self::new("already_connected", "another client is already connected")
     }
+}
+
+/// Default and ceiling for `list_errors`, so a client cannot ask the service to
+/// serialize an unbounded table.
+const DEFAULT_ERROR_LIMIT: u32 = 20;
+pub const MAX_ERROR_LIMIT: u32 = 200;
+
+fn default_error_limit() -> u32 {
+    DEFAULT_ERROR_LIMIT
 }
 
 /// The closed set of operations. `op` is the discriminant; unknown values fail
@@ -43,6 +55,10 @@ pub enum RequestBody {
     ReadSms { index: u32 },
     DeleteSms { index: u32 },
     Health,
+    ListErrors {
+        #[serde(default = "default_error_limit")]
+        limit: u32,
+    },
 }
 
 impl RequestBody {
@@ -53,6 +69,7 @@ impl RequestBody {
             RequestBody::ReadSms { .. } => "read_sms",
             RequestBody::DeleteSms { .. } => "delete_sms",
             RequestBody::Health => "health",
+            RequestBody::ListErrors { .. } => "list_errors",
         }
     }
 }

@@ -23,10 +23,17 @@ Requests carry a client-chosen `id` echoed back on the response.
 | `{"id":1,"op":"list_sms"}` | `{"id":1,"ok":true,"messages":[{index,status,sender,timestamp,text}]}` |
 | `{"id":2,"op":"read_sms","index":5}` | `{"id":2,"ok":true,"message":{...}}` |
 | `{"id":3,"op":"delete_sms","index":5}` | `{"id":3,"ok":true}` |
-| `{"id":4,"op":"health"}` | `{"id":4,"ok":true,"status":{modem,sim,started_at,uptime_s,recent_errors}}` |
+| `{"id":4,"op":"health"}` | `{"id":4,"ok":true,"status":{modem,sim,started_at,uptime_s}}` |
+| `{"id":5,"op":"list_errors","limit":20}` | `{"id":5,"ok":true,"errors":[{rowid,ts,severity,context,message,req_rowid}]}` |
 
 Errors: `{"id":N,"ok":false,"error":{"code":"...","message":"..."}}`
-(`bad_request`, `not_found`, `modem_error`, `modem_not_ready`, `already_connected`).
+(`bad_request`, `not_found`, `modem_error`, `modem_not_ready`, `storage_error`,
+`already_connected`).
+
+`health` answers one question — is the modem ready. When something is wrong,
+`list_errors` explains it: bring-up failures *and* failed requests (linked back to
+the request via `req_rowid`), newest first. `limit` defaults to 20, max 200. It is
+a plain database read, so it still answers while the modem is `not_ready`.
 
 SMS index is the modem's native storage slot; `read_sms` marks a message read;
 bodies are handled in text mode (`AT+CMGF=1`).
